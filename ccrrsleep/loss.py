@@ -1,0 +1,108 @@
+import tensorflow as tf
+
+class GHMCLoss:
+    def __init__(self, bins=10, momentum=0.75):
+        self.bins = bins
+        self.momentum = momentum
+        self.edges_left, self.edges_right = self.get_edges(self.bins)  # edges_left: [bins, 1, 1], edges_right: [bins, 1, 1]
+        if momentum > 0:
+            self.acc_sum = self.get_acc_sum(self.bins) # [bins]
+
+    def get_edges(self, bins):
+        edges_left = [float(x) / bins for x in range(bins)]
+        edges_left = tf.constant(edges_left) # [bins]
+        edges_left = tf.expand_dims(edges_left, -1) # [bins, 1]
+        edges_left = tf.expand_dims(edges_left, -1) # [bins, 1, 1]
+
+        edges_right = [float(x) / bins for x in range(1, bins + 1)]
+        edges_right[-1] += 1e-6
+        edges_right = tf.constant(edges_right) # [bins]
+        edges_right = tf.expand_dims(edges_right, -1) # [bins, 1]
+        edges_right = tf.expand_dims(edges_right, -1) # [bins, 1, 1]
+        return edges_left, edges_right
+
+    def get_acc_sum(self, bins):
+        acc_sum = [0.0 for _ in range(bins)]
+        return tf.Variable(acc_sum, trainable=False)
+
+    def calc(self, target, input,  mask=None, is_mask=False):
+        """ Args:
+        input [batch_num, class_num]:
+            The direct prediction of classification fc layer.
+        target [batch_num, class_num]:
+            Binary target (0 or 1) for each sample each class. The value is -1
+            when the sample is ignored.
+        mask [batch_num, class_num]
+        """
+        edges_left, edges_right = self.edges_left, self.edges_right
+        mmt = self.momentum
+        # gradient length
+        self.g = tf.abs(tf.sigmoid(input) - target) # [batch_num, class_num]
+        g = tf.expand_dims(self.g, axis=0) # [1, batch_num, class_num]
+        g_greater_equal_edges_left = tf.greater_equal(g, edges_left)# [bins, batch_num, class_num]
+        g_less_edges_right = tf.less(g, edges_right)# [bins, batch_num, class_num]
+        zero_matrix = tf.cast(tf.zeros_like(g_greater_equal_edges_left), dtype=tf.float32) # [bins, batch_num, class_num]
+        if is_mask:
+            mask_greater_zero = tf.greater(mask, 0)
+            inds = tf.cast(tf.logical_and(tf.logical_and(g_greater_equal_edges_left, g_less_edges_right),
+                                          mask_greater_zero), dtype=tf.float32)  # [bins, batch_num, class_num]
+            tot = tf.maximum(tf.reduce_sum(tf.cast(mask_greater_zero, dtype=tf.float32)), 1.0)
+        else:
+            inds = tf.cast(tf.logical_and(g_greater_equal_edges_left, g_less_edges_right),
+                           dtype=tf.float32)  # [bins, batch_num, class_num]
+            input_shape = tf.shape(input)
+            tot = tf.maximum(tf.cast(input_shape[0] * input_shape[1], dtype=tf.float32), 1.0)
+        num_in_bin = tf.reduce_sum(inds, axis=[1, 2]) # [bins]
+        num_in_bin_greater_zero = tf.greater(num_in_bin, 0) # [bins]
+        num_valid_bin = tf.reduce_sum(tf.cast(num_in_bin_greater_zero, dtype=tf.float32))
+
+        # num_in_bin = num_in_bin + 1e-12
+        if mmt > 0:
+            update = tf.assign(self.acc_sum, tf.where(num_in_bin_greater_zero, mmt * self.acc_sum \
+                                  + (1 - mmt) * num_in_bin, self.acc_sum))
+            with tf.control_dependencies([update]):
+                self.acc_sum_tmp = tf.identity(self.acc_sum, name='updated_accsum')
+                acc_sum = tf.expand_dims(self.acc_sum_tmp, -1)  # [bins, 1]
+                acc_sum = tf.expand_dims(acc_sum, -1)  # [bins, 1, 1]
+                acc_sum = acc_sum + zero_matrix # [bins, batch_num, class_num]
+                weights = tf.where(tf.equal(inds, 1), tot / acc_sum, zero_matrix)
+                weights = tf.reduce_sum(weights, axis=0)
+        else:
+            num_in_bin = tf.expand_dims(num_in_bin, -1)  # [bins, 1]
+            num_in_bin = tf.expand_dims(num_in_bin, -1)  # [bins, 1, 1]
+            num_in_bin = num_in_bin + zero_matrix # [bins, batch_num, class_num]
+            weights = tf.where(tf.equal(inds, 1), tot / num_in_bin, zero_matrix)
+            weights = tf.reduce_sum(weights, axis=0)
+        weights = weights / num_valid_bin
+        loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=target, logits=input)
+        loss = tf.reduce_sum(loss * weights) / tot
+        return loss
+
+
+def focal_loss(labels, logits, gamma=2.0, alpha=0.25):
+    logits = tf.nn.softmax(logits, dim=-1)
+    epsilon = 1.e-9
+    labels = tf.to_int64(labels)
+    labels = tf.convert_to_tensor(labels, tf.int64)
+    logits = tf.convert_to_tensor(logits, tf.float32)
+    num_cls = logits.shape[1]
+
+    model_out = tf.add(logits, epsilon)
+    onehot_labels = tf.one_hot(labels, num_cls)
+    ce = tf.multiply(onehot_labels, -tf.log(model_out))
+    weight = tf.multiply(onehot_labels, tf.pow(tf.subtract(1., model_out), gamma))
+    fl = tf.multiply(alpha, tf.multiply(weight, ce))
+    # reduced_fl = tf.reduce_max(fl, axis=1)
+    reduced_fl = tf.reduce_sum(fl, axis=1)  # same as reduce_max
+    return reduced_fl
+
+
+def ghmc_loss(labels, logits,momentum=0.75):
+    logits = tf.nn.softmax(logits, dim=-1)
+    labels = tf.to_int64(labels)
+    labels = tf.convert_to_tensor(labels, tf.int64)
+    logits = tf.convert_to_tensor(logits, tf.float32)
+    num_cls = logits.shape[1]
+    onehot_labels = tf.one_hot(labels, num_cls)
+    ghm = GHMCLoss(momentum=momentum)
+    return ghm.calc(onehot_labels, logits)
